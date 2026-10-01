@@ -60,5 +60,5 @@ export function useTreeThreads() {
     [hostThreads, children],
   );
 
-  return { status, threads, projects };
+  return { status, threads, projects, refetch };
 }

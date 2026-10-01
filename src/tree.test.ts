@@ -4,11 +4,18 @@ import type { ChildThread } from "../server";
 import {
   ancestorIds,
   buildForest,
+  comparePins,
   countDescendants,
+  countStatuses,
   filterForest,
   flattenForest,
+  forestStats,
+  formatAge,
+  isFinishedWorker,
   latestActivity,
   mergeThreads,
+  movePin,
+  pruneForest,
 } from "./tree";
 
 function hostThread(
@@ -317,5 +324,162 @@ describe("ancestorIds", () => {
     );
     expect(ancestorIds(threads, "grandchild")).toEqual(["worker", "parent"]);
     expect(ancestorIds(threads, null)).toEqual([]);
+  });
+});
+
+describe("forestStats", () => {
+  const threads = mergeThreads(
+    [hostThread({ id: "p", updatedAt: 100 })],
+    [
+      childThread({ id: "done", parentThreadId: "p", updatedAt: 300 }),
+      childThread({ id: "busy", parentThreadId: "p", isWorking: true, updatedAt: 200 }),
+      childThread({ id: "deep", parentThreadId: "busy", isFailed: true, updatedAt: 900 }),
+      childThread({ id: "ask", parentThreadId: "p", needsInput: true, updatedAt: 200 }),
+    ],
+  );
+  const stats = forestStats(buildForest(threads));
+
+  it("counts every descendant by state", () => {
+    expect(stats.get("p")?.summary).toEqual({
+      total: 4,
+      done: 1,
+      working: 1,
+      needsInput: 1,
+      failed: 1,
+      worst: "failed",
+    });
+    expect(stats.get("busy")?.summary).toMatchObject({ total: 1, failed: 1 });
+    expect(stats.get("done")?.summary.total).toBe(0);
+  });
+
+  it("dates each node by the latest activity beneath it", () => {
+    expect(stats.get("p")?.activity).toBe(900);
+    expect(stats.get("done")?.activity).toBe(300);
+  });
+
+  it("ranks waiting on the user over running, and failure over both", () => {
+    const waiting = forestStats(
+      buildForest(
+        mergeThreads(
+          [hostThread({ id: "p" })],
+          [
+            childThread({ id: "a", parentThreadId: "p", isWorking: true }),
+            childThread({ id: "b", parentThreadId: "p", needsInput: true }),
+          ],
+        ),
+      ),
+    );
+    expect(waiting.get("p")?.summary.worst).toBe("needs-input");
+  });
+});
+
+describe("pin order", () => {
+  const pin = (id: string, pinSortKey: string | null, pinnedAt: number) =>
+    hostThread({ id, isPinned: true, pinSortKey, pinnedAt });
+
+  it("puts dragged pins first by key, then the rest newest pin first", () => {
+    const pins = [pin("old", null, 1), pin("b", "b", 5), pin("new", null, 9), pin("a", "a", 2)];
+    expect([...pins].sort(comparePins).map((p) => p.id)).toEqual(["a", "b", "new", "old"]);
+  });
+
+  it("orders pinned roots by pin order in both sort modes", () => {
+    const threads = mergeThreads(
+      [
+        pin("first", "a", 1),
+        pin("second", "b", 2),
+        hostThread({ id: "loose", updatedAt: 99_999 }),
+      ],
+      [],
+    );
+    for (const mode of ["activity", "name"] as const) {
+      expect(buildForest(threads, mode).map((n) => n.thread.id)).toEqual([
+        "first",
+        "second",
+        "loose",
+      ]);
+    }
+  });
+
+  it("keeps an unconfirmed drop in place", () => {
+    const threads = mergeThreads([pin("x", "a", 1), pin("y", "b", 2), pin("z", "c", 3)], []);
+    expect(
+      buildForest(threads, "activity", ["z", "x", "y"]).map((n) => n.thread.id),
+    ).toEqual(["z", "x", "y"]);
+  });
+});
+
+describe("movePin", () => {
+  it("reports the new neighbours of the moved pin", () => {
+    expect(movePin(["a", "b", "c"], "c", 0)).toEqual({
+      order: ["c", "a", "b"],
+      previousThreadId: null,
+      nextThreadId: "a",
+    });
+    expect(movePin(["a", "b", "c"], "a", 1)).toEqual({
+      order: ["b", "a", "c"],
+      previousThreadId: "b",
+      nextThreadId: "c",
+    });
+  });
+
+  it("does nothing for a move that goes nowhere", () => {
+    expect(movePin(["a", "b"], "a", 0)).toBeNull();
+    expect(movePin(["a", "b"], "a", -1)).toBeNull();
+    expect(movePin(["a", "b"], "missing", 0)).toBeNull();
+  });
+});
+
+describe("view filters", () => {
+  const threads = mergeThreads(
+    [hostThread({ id: "p" }), hostThread({ id: "q" })],
+    [
+      childThread({ id: "finished", parentThreadId: "p" }),
+      childThread({ id: "running", parentThreadId: "p", isWorking: true }),
+      childThread({ id: "spent", parentThreadId: "q" }),
+    ],
+  );
+
+  it("drops finished hidden workers but keeps everything else", () => {
+    const { forest } = pruneForest(buildForest(threads), (t) => !isFinishedWorker(t));
+    expect(forest.map((n) => [n.thread.id, n.children.map((c) => c.thread.id)])).toEqual([
+      ["p", ["running"]],
+      ["q", []],
+    ]);
+  });
+
+  it("keeps the ancestors of a status match, and reports them to unfold", () => {
+    const { forest, matchedAncestors } = pruneForest(
+      buildForest(threads),
+      (t) => t.status === "working",
+    );
+    expect(forest.map((n) => n.thread.id)).toEqual(["p"]);
+    expect([...matchedAncestors]).toEqual(["p"]);
+  });
+
+  it("counts threads per filterable status", () => {
+    expect(countStatuses(threads.values())).toEqual({
+      "needs-input": 0,
+      failed: 0,
+      working: 1,
+    });
+  });
+});
+
+describe("formatAge", () => {
+  const minute = 60_000;
+  it.each([
+    [0, "now"],
+    [5 * minute, "5m"],
+    [3 * 60 * minute, "3h"],
+    [4 * 24 * 60 * minute, "4d"],
+    [15 * 24 * 60 * minute, "2w"],
+    [70 * 24 * 60 * minute, "2mo"],
+    [400 * 24 * 60 * minute, "1y"],
+  ])("%i ms ago reads %s", (age, label) => {
+    expect(formatAge(1_000_000_000 - age, 1_000_000_000)).toBe(label);
+  });
+
+  it("never reads a clock skew as negative", () => {
+    expect(formatAge(2_000, 1_000)).toBe("now");
   });
 });

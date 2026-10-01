@@ -1,4 +1,4 @@
-import type { ReactNode } from "react";
+import { useRef, type ReactNode } from "react";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
   experimental_useSidebarThreadActions as useSidebarThreadActions,
@@ -18,12 +18,21 @@ export function RowMenu({
   thread,
   children,
   onNavigate,
+  onRename,
+  onMove,
 }: {
   thread: PluginSidebarThread;
   children: ReactNode;
   onNavigate: () => void;
+  /** Turns the row's title into an inline field. */
+  onRename: () => void;
+  /** Pin reordering for a pinned root; a null direction is at the edge. */
+  onMove: { up: (() => void) | null; down: (() => void) | null } | null;
 }) {
   const actions = useSidebarThreadActions();
+  // Radix hands focus back to the row as the menu closes, which would blur
+  // the rename field the moment it mounted; so it mounts after that instead.
+  const renameRequested = useRef(false);
 
   return (
     <ContextMenu.Root>
@@ -31,6 +40,12 @@ export function RowMenu({
       <ContextMenu.Portal>
         <ContextMenu.Content
           aria-label="Thread actions"
+          onCloseAutoFocus={(event) => {
+            if (!renameRequested.current) return;
+            renameRequested.current = false;
+            event.preventDefault();
+            onRename();
+          }}
           className="z-50 min-w-44 rounded-lg border border-border bg-popover p-1 text-popover-foreground shadow-md"
         >
           <Item
@@ -41,6 +56,13 @@ export function RowMenu({
           >
             Open in split
           </Item>
+          <Item
+            onSelect={() => {
+              renameRequested.current = true;
+            }}
+          >
+            Rename
+          </Item>
           <Separator />
           <Item onSelect={() => void actions.setRead(thread.id, thread.isUnread)}>
             {thread.isUnread ? "Mark read" : "Mark unread"}
@@ -50,6 +72,8 @@ export function RowMenu({
           >
             {thread.isPinned ? "Unpin" : "Pin"}
           </Item>
+          {onMove?.up ? <Item onSelect={onMove.up}>Move up</Item> : null}
+          {onMove?.down ? <Item onSelect={onMove.down}>Move down</Item> : null}
           <Separator />
           <Item onSelect={() => actions.archive(thread.id)}>Archive</Item>
           <Item destructive onSelect={() => actions.requestDelete(thread.id)}>

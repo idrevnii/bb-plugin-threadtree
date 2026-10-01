@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { AUTO_ARCHIVE_DELAYS, shouldAutoArchive, staleRoots } from "./autoArchive";
+import {
+  AUTO_ARCHIVE_DELAYS,
+  archivedBy,
+  shouldAutoArchive,
+  staleRoots,
+  sweepCandidates,
+} from "./autoArchive";
 
 const IDLE = {
   parentThreadId: null,
@@ -69,5 +75,62 @@ describe("staleRoots", () => {
 
   it("survives a parent cycle", () => {
     expect(staleRoots([thread("a", "b"), thread("b", "a")], 0)).toEqual([]);
+  });
+});
+
+describe("sweepCandidates", () => {
+  const thread = (id: string, parentThreadId: string | null = null) => ({
+    ...IDLE,
+    id,
+    parentThreadId,
+  });
+
+  it("dates a root by the latest touch anywhere beneath it", () => {
+    const candidates = sweepCandidates([
+      { ...thread("p"), updatedAt: 10 },
+      { ...thread("c", "p"), lastReadAt: 50 },
+      { ...thread("w", "c"), updatedAt: 30 },
+    ]);
+    expect(candidates.map(({ root, lastTouchedAt }) => [root.id, lastTouchedAt])).toEqual([
+      ["p", 50],
+    ]);
+  });
+
+  it("leaves out a root with anything pinned, busy or waiting below it", () => {
+    const waiting = { ...thread("c", "p"), hasPendingInteraction: true };
+    expect(sweepCandidates([thread("p"), waiting])).toEqual([]);
+  });
+
+  it("agrees with staleRoots at every cutoff", () => {
+    const threads = [
+      { ...thread("a"), updatedAt: 5 },
+      { ...thread("b"), updatedAt: 20 },
+      { ...thread("c", "b"), updatedAt: 40 },
+    ];
+    for (const cutoff of [0, 5, 19, 20, 39, 40, 100]) {
+      const fromCandidates = sweepCandidates(threads)
+        .filter((candidate) => candidate.lastTouchedAt <= cutoff)
+        .map((candidate) => candidate.root.id);
+      expect(staleRoots(threads, cutoff).map((t) => t.id)).toEqual(fromCandidates);
+    }
+  });
+});
+
+describe("archivedBy", () => {
+  const day = AUTO_ARCHIVE_DELAYS["1 day"]!;
+  const now = 10 * day;
+  const candidates = [
+    { id: "recent", lastTouchedAt: now - day / 2 },
+    { id: "old", lastTouchedAt: now - 5 * day },
+    { id: "older", lastTouchedAt: now - 9 * day },
+  ];
+
+  it("takes what is idle for at least the delay, oldest first", () => {
+    expect(archivedBy(candidates, now, day).map((c) => c.id)).toEqual(["older", "old"]);
+    expect(archivedBy(candidates, now, 7 * day).map((c) => c.id)).toEqual(["older"]);
+  });
+
+  it("takes nothing when off", () => {
+    expect(archivedBy(candidates, now, 0)).toEqual([]);
   });
 });

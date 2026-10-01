@@ -8,6 +8,7 @@ import { DEFAULT_SORT_MODE, isSortMode, type SortMode } from "./tree";
 const STORAGE_KEY = "bb-plugin-threadtree.expanded";
 const COLLAPSED_PROJECTS_KEY = "bb-plugin-threadtree.collapsed-projects";
 const SORT_MODE_KEY = "bb-plugin-threadtree.sort-mode";
+const HIDE_FINISHED_KEY = "bb-plugin-threadtree.hide-finished-workers";
 
 function loadIds(key: string): Set<string> {
   try {
@@ -60,5 +61,22 @@ export function saveSortMode(mode: SortMode): void {
     window.localStorage.setItem(SORT_MODE_KEY, mode);
   } catch {
     // Same as the folds: losing the preference is better than breaking.
+  }
+}
+
+/** Whether finished hidden workers are left out, remembered per client. */
+export function loadHideFinished(): boolean {
+  try {
+    return window.localStorage.getItem(HIDE_FINISHED_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+export function saveHideFinished(hide: boolean): void {
+  try {
+    window.localStorage.setItem(HIDE_FINISHED_KEY, String(hide));
+  } catch {
+    // A view preference; losing it is better than breaking.
   }
 }

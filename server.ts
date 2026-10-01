@@ -9,7 +9,12 @@
 // choosing a replacement list also replaces bb's project controls.
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
-import { AUTO_ARCHIVE_DELAYS, isBusy, staleRoots } from "./src/autoArchive";
+import {
+  AUTO_ARCHIVE_DELAYS,
+  isBusy,
+  staleRoots,
+  sweepCandidates,
+} from "./src/autoArchive";
 
 /** Frontend refetch signal; the payload carries nothing. */
 export const TREE_CHANNEL = "tree";
@@ -69,6 +74,21 @@ const childThreadSchema = z.object({
 
 export type ChildThread = z.infer<typeof childThreadSchema>;
 
+/** A root the auto-archive sweep could take, for the settings preview. */
+const archiveCandidateSchema = z.object({
+  id: z.string(),
+  projectId: z.string(),
+  /** "Chats" for the personal project, like the sidebar; null if unknown. */
+  projectName: z.string().nullable(),
+  title: z.string(),
+  /** Latest write or read anywhere in its subtree, epoch ms. */
+  lastTouchedAt: z.number(),
+  /** Threads that go with it, the root included. */
+  threadCount: z.number(),
+});
+
+export type ArchiveCandidate = z.infer<typeof archiveCandidateSchema>;
+
 export const rpcContract = defineRpcContract({
   /** Every non-archived child thread, at any depth, hidden ones included. */
   listChildren: {
@@ -94,6 +114,18 @@ export const rpcContract = defineRpcContract({
   removeProject: {
     input: z.object({ projectId: z.string() }),
     output: z.object({ ok: z.literal(true) }),
+  },
+  /**
+   * Every root the sweep could archive under some setting. The caller decides
+   * which ones a given idle period takes, so switching the setting in the UI
+   * does not need another round trip.
+   */
+  previewAutoArchive: {
+    input: z.null(),
+    output: z.object({
+      now: z.number(),
+      candidates: z.array(archiveCandidateSchema),
+    }),
   },
   getPinnedProjects: {
     input: z.null(),
@@ -223,6 +255,45 @@ export default function plugin(bb: BbPluginApi) {
         bb.realtime.publish(PINS_CHANNEL, {});
       }
       return { ok: true as const };
+    },
+    async previewAutoArchive() {
+      const [threads, projects] = await Promise.all([
+        listAllThreads(),
+        bb.sdk.projects.list({ includePersonal: true }),
+      ]);
+      const projectNames = new Map(
+        projects.map((project) => [
+          project.id,
+          project.kind === "personal" ? "Chats" : project.name,
+        ]),
+      );
+      const children = new Map<string, string[]>();
+      for (const thread of threads) {
+        if (thread.parentThreadId === null) continue;
+        const siblings = children.get(thread.parentThreadId);
+        if (siblings) siblings.push(thread.id);
+        else children.set(thread.parentThreadId, [thread.id]);
+      }
+      const subtreeSize = (id: string, seen = new Set<string>()): number => {
+        if (seen.has(id)) return 0;
+        seen.add(id);
+        return (children.get(id) ?? []).reduce(
+          (size, childId) => size + subtreeSize(childId, seen),
+          1,
+        );
+      };
+      return {
+        now: Date.now(),
+        candidates: sweepCandidates(threads).map(({ root, lastTouchedAt }) => ({
+          id: root.id,
+          projectId: root.projectId,
+          projectName: projectNames.get(root.projectId) ?? null,
+          title:
+            root.title?.trim() || root.titleFallback?.trim() || "Untitled thread",
+          lastTouchedAt,
+          threadCount: subtreeSize(root.id),
+        })),
+      };
     },
     async getPinnedProjects() {
       return { projectIds: await readPinnedProjects() };
