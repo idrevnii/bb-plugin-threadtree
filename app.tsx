@@ -9,7 +9,7 @@
 // sidebar: the built-in list stays the default until the user picks this one
 // under Settings → Appearance → Sidebar. The New-thread button, the search
 // field, the plugin nav rows, and the footer stay host-rendered.
-import { definePluginApp } from "@bb/plugin-sdk/app";
+import { definePluginApp } from "@get-bb/plugin-sdk/app";
 import { ThreadTree } from "./src/ThreadTree";
 
 export default definePluginApp((app) => {

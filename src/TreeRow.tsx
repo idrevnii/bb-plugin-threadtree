@@ -2,7 +2,7 @@ import {
   experimental_useSidebarThreadActions as useSidebarThreadActions,
   experimental_useSidebarThreadSplit as useSidebarThreadSplit,
   useBbNavigate,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { Icon } from "@/src/components/ui/icon";
 import { cn } from "@/src/lib/utils";
 import { RowMenu } from "./RowMenu";
@@ -96,7 +96,12 @@ export function TreeRow({
         // them navigates through this row's own handler.
         data-sidebar-thread-shortcut-target=""
         data-sidebar-thread-id={thread.id}
-        href={`/threads/${thread.id}`}
+        // The host's own URL where it knows the thread, so copy-link and
+        // open-in-new-window land on the same route bb's list uses.
+        href={
+          thread.host?.href ??
+          `/projects/${thread.projectId}/threads/${thread.id}`
+        }
         onClick={(event) => {
           event.preventDefault();
           open();

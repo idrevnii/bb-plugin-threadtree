@@ -7,7 +7,7 @@
 //
 // Thread actions stay host-owned. Project creation/removal live here because
 // choosing a replacement list also replaces bb's project controls.
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { AUTO_ARCHIVE_DELAYS, isBusy, staleRoots } from "./src/autoArchive";
 

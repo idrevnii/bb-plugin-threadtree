@@ -1,6 +1,6 @@
 // The tree: merging, nesting, searching, flattening. Pure functions over
 // plain data, so the rules are testable without mounting a sidebar.
-import type { PluginSidebarThread } from "@bb/plugin-sdk/app";
+import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type { ChildThread } from "../server";
 
 /**
@@ -46,6 +46,7 @@ function displayTitle(thread: {
 function hostStatus(thread: PluginSidebarThread): RowStatus {
   switch (thread.indicator) {
     case "unread-error":
+    case "queued-failed":
       return "failed";
     case "waiting-for-input":
       return "needs-input";
@@ -56,6 +57,7 @@ function hostStatus(thread: PluginSidebarThread): RowStatus {
     case "plan-mode":
     case "goal":
     case "working-draft":
+    case "queued-waiting":
       return "working";
     case "unread-success":
       return "unread";
@@ -80,10 +82,11 @@ export function mergeThreads(
       id: thread.id,
       projectId: thread.projectId,
       parentThreadId: thread.parentThreadId,
-      title: displayTitle(thread),
+      // bb's own resolved title, with `@thread:` mentions turned into names.
+      title: thread.displayTitle.trim() || displayTitle(thread),
       createdAt: thread.createdAt,
       updatedAt: thread.updatedAt,
-      isHidden: false,
+      isHidden: thread.isHidden,
       status: hostStatus(thread),
       host: thread,
     });

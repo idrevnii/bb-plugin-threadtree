@@ -3,7 +3,7 @@ import {
   experimental_useSidebarThreads as useSidebarThreads,
   useRealtime,
   useRpc,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import type { ChildThread, rpcContract } from "../server";
 import { mergeThreads } from "./tree";
 

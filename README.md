@@ -15,20 +15,21 @@ spawns, which bb's own sidebar never shows.
 ## Why a plugin needs a backend for this
 
 `bb thread spawn --visibility hidden` (and any child that inherits a hidden
-parent) creates a thread the sidebar deliberately filters out: the server's
-sidebar bootstrap query is `WHERE visibility = 'visible'`. That filter is
-upstream of the plugin hook too, so `experimental_useSidebarThreads()` cannot
-see those threads at all — a frontend-only plugin would have nothing to draw.
+parent) creates a thread bb's own sidebar deliberately filters out. Since
+plugin SDK 0.5 the host list handed to `experimental_useSidebarThreads()`
+carries those threads too, flagged `isHidden`; older hosts left them out
+entirely.
 
 So the plugin is two halves:
 
-- **`server.ts`** — one read-only RPC listing every child thread through
-  `bb.sdk.threads.list({ hasParent: true, includeHidden: true })`, plus a
-  realtime ping on the lifecycle events those hidden threads still emit.
+- **`server.ts`** — one read-only RPC listing every child and hidden thread
+  through `bb.sdk.threads.list({ includeHidden: true })`, plus a realtime ping
+  on the lifecycle events those threads emit. It is the fallback for anything
+  the host list does not carry.
 - **`src/`** — the sidebar list, merging those rows into bb's own live list.
   The host list stays authoritative for everything it covers (pins, unread,
-  resolved status), so the tree keeps updating at bb's cadence; the RPC only
-  adds rows the host cannot see.
+  resolved status, titles), so the tree keeps updating at bb's cadence; the
+  RPC only adds rows the host cannot see.
 
 ## Enabling it
 
@@ -43,14 +44,14 @@ bb plugin dev        # watch loop while editing
 
 ## Behavior worth knowing
 
-- **Opening a hidden worker** goes through `toThread`, not the host's `open`,
-  which silently ignores ids absent from its sidebar list.
+- **Opening a thread the host list lacks** goes through `toThread`, not the
+  host's `open`, which silently ignores ids absent from its sidebar list.
 - **Projects** stay available above the tree, including projects with no
   threads. Click one to open it, or use the folder-plus button to add a local
   folder as a project.
 - **Right-click** gives bb's own actions (split, read, pin, archive, delete)
-  on ordinary threads. Hidden workers get no menu: those actions reject ids
-  the host does not know, so there is nothing honest to offer.
+  on every thread the host list carries. Rows only the RPC knows get no menu:
+  those actions reject ids the host does not know.
 - **Keyboard** — bb's numbered jumps and `thread.next` / `thread.previous`
   work on every row, hidden ones included, because the host clicks the row
   element rather than opening by id.
@@ -76,6 +77,5 @@ npm run build
 `src/tree.test.ts` covers the rules (merging, nesting, orphans, sorting,
 search, flattening); `src/ThreadTree.test.tsx` mounts the real slot through
 the official `@get-bb/plugin-sdk/testing/app` harness, which also validates
-the registration with the host's own rules. That harness is a devDependency
-from npm and can be a patch release ahead of the SDK types the plugin builds
-against, so `vitest.config.ts` maps `@bb/plugin-sdk*` onto it for tests only.
+the registration with the host's own rules. Run `bb plugin types` after a bb
+upgrade to repin `@get-bb/plugin-sdk` to the running version.

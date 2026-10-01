@@ -5,7 +5,7 @@ import {
   useRpc,
   type PluginSidebarProject,
   type PluginThreadListProps,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { Icon } from "@/src/components/ui/icon";
 import {
   AlertDialog,

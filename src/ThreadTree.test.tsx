@@ -45,10 +45,15 @@ function hostThread(
     title: overrides.id,
     titleFallback: null,
     parentThreadId: null,
+    lifecycleOwnerThreadId: null,
+    sourceThreadId: null,
     sectionId: null,
     originKind: null,
     originPluginId: null,
     providerId: "claude-code",
+    status: "idle",
+    runtimeStatus: "idle",
+    queuedWork: "none",
     hasPendingInteraction: false,
     activity: {
       workflows: 0,
@@ -61,14 +66,21 @@ function hostThread(
     indicatorLabel: null,
     isUnread: false,
     isPinned: false,
+    pinnedAt: null,
+    pinSortKey: null,
     isArchived: false,
+    archivedAt: null,
     environment: null,
     host: null,
     createdAt: 1_000,
     updatedAt: 1_000,
     lastReadAt: null,
     latestAttentionAt: 0,
+    href: `/projects/${overrides.projectId ?? "proj_1"}/threads/${overrides.id}`,
+    isHidden: false,
     ...overrides,
+    // Follows `title` the way bb derives it, unless a test sets it itself.
+    displayTitle: overrides.displayTitle ?? overrides.title ?? overrides.id,
   };
 }
 
@@ -155,13 +167,17 @@ function render(
         threads: options.threads ?? [
           hostThread({ id: "thr_parent", title: "Orchestrator" }),
         ],
-        projects: options.projects ?? [
+        projects: (options.projects ?? [
           {
             id: "proj_1",
             name: options.personalProject ? "Personal" : "Project",
             isPersonal: options.personalProject ?? false,
           },
-        ],
+        ]).map((project) => ({
+          ...project,
+          href: `/projects/${project.id}`,
+          settingsHref: `/projects/${project.id}/settings`,
+        })),
       },
     },
   );

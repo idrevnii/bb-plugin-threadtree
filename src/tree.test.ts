@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { PluginSidebarThread } from "@bb/plugin-sdk/app";
+import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type { ChildThread } from "../server";
 import {
   ancestorIds,
@@ -19,10 +19,15 @@ function hostThread(
     title: overrides.id,
     titleFallback: null,
     parentThreadId: null,
+    lifecycleOwnerThreadId: null,
+    sourceThreadId: null,
     sectionId: null,
     originKind: null,
     originPluginId: null,
     providerId: "claude-code",
+    status: "idle",
+    runtimeStatus: "idle",
+    queuedWork: "none",
     hasPendingInteraction: false,
     activity: {
       workflows: 0,
@@ -35,14 +40,21 @@ function hostThread(
     indicatorLabel: null,
     isUnread: false,
     isPinned: false,
+    pinnedAt: null,
+    pinSortKey: null,
     isArchived: false,
+    archivedAt: null,
     environment: null,
     host: null,
     createdAt: 1_000,
     updatedAt: overrides.createdAt ?? 1_000,
     lastReadAt: null,
     latestAttentionAt: 0,
+    href: `/projects/${overrides.projectId ?? "proj_1"}/threads/${overrides.id}`,
+    isHidden: false,
     ...overrides,
+    // Follows `title` the way bb derives it, unless a test sets it itself.
+    displayTitle: overrides.displayTitle ?? overrides.title ?? overrides.id,
   };
 }
 
@@ -90,6 +102,29 @@ describe("mergeThreads", () => {
     // The host row is the one with the resolved indicator; the SDK row is not.
     expect(merged.get("fork")?.status).toBe("working");
     expect(merged.get("fork")?.host).not.toBeNull();
+  });
+
+  it("takes the title and hidden flag from the host row", () => {
+    const merged = mergeThreads(
+      [
+        hostThread({
+          id: "worker",
+          title: "Review @thread:thr_x",
+          displayTitle: "Review Deploy fix",
+          isHidden: true,
+        }),
+      ],
+      [],
+    );
+    expect(merged.get("worker")?.title).toBe("Review Deploy fix");
+    expect(merged.get("worker")?.isHidden).toBe(true);
+  });
+
+  it("maps queued-message indicators like bb's own list", () => {
+    const status = (indicator: PluginSidebarThread["indicator"]) =>
+      mergeThreads([hostThread({ id: "t", indicator })], []).get("t")?.status;
+    expect(status("queued-failed")).toBe("failed");
+    expect(status("queued-waiting")).toBe("working");
   });
 
   it("maps a child's state onto the row's four statuses", () => {
