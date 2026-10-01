@@ -170,6 +170,11 @@ export function compareTitles(left: string, right: string): number {
 export function buildForest(
   threads: ReadonlyMap<string, TreeThread>,
   sortMode: SortMode = DEFAULT_SORT_MODE,
+  /**
+   * The pin order of a drop the host has not confirmed yet, so a dragged row
+   * stays where it was put instead of snapping back for a round trip.
+   */
+  pinOverride?: readonly string[],
 ): TreeNode[] {
   const nodes = new Map<string, TreeNode>();
   for (const thread of threads.values()) {
@@ -200,15 +205,87 @@ export function buildForest(
     // of a long spawn list.
     node.children.sort(sortMode === "name" ? byName : byActivity);
   }
-  // Pinned stays first in both modes: it is the user's own ordering, and a
-  // sort choice is not a request to unpin.
-  roots.sort(
-    (left, right) =>
-      Number(right.thread.host?.isPinned ?? false) -
-        Number(left.thread.host?.isPinned ?? false) ||
-      (sortMode === "name" ? byName(left, right) : byActivity(left, right)),
-  );
+  // Pinned stays first in both modes, in the user's own drag order: that is
+  // their ordering, and a sort choice is not a request to undo it.
+  roots.sort((left, right) => {
+    const leftHost = left.thread.host;
+    const rightHost = right.thread.host;
+    const leftPinned = leftHost?.isPinned ?? false;
+    const rightPinned = rightHost?.isPinned ?? false;
+    if (leftPinned !== rightPinned) return Number(rightPinned) - Number(leftPinned);
+    if (leftPinned && leftHost && rightHost) return comparePins(leftHost, rightHost);
+    return sortMode === "name" ? byName(left, right) : byActivity(left, right);
+  });
+  if (pinOverride) applyPinOverride(roots, pinOverride);
   return roots;
+}
+
+/**
+ * Re-deal the overridden pins into the slots they already hold, in the
+ * override's order. A pass of its own rather than a comparator rule: mixing
+ * override ranks with sort keys would not be a consistent ordering.
+ */
+function applyPinOverride(roots: TreeNode[], order: readonly string[]): void {
+  const pinned = new Set(
+    roots.filter((node) => node.thread.host?.isPinned).map((node) => node.thread.id),
+  );
+  const wanted = order.filter((id) => pinned.has(id));
+  const wantedSet = new Set(wanted);
+  const byId = new Map(roots.map((node) => [node.thread.id, node]));
+  let next = 0;
+  roots.forEach((node, slot) => {
+    if (wantedSet.has(node.thread.id)) roots[slot] = byId.get(wanted[next++]!)!;
+  });
+}
+
+type PinFields = Pick<
+  PluginSidebarThread,
+  "id" | "pinSortKey" | "pinnedAt" | "createdAt"
+>;
+
+/**
+ * bb's own pin order: reordered pins by their key, then pins never dragged,
+ * newest pin first.
+ */
+export function comparePins(left: PinFields, right: PinFields): number {
+  if (left.pinSortKey !== null && right.pinSortKey !== null) {
+    if (left.pinSortKey !== right.pinSortKey) {
+      return left.pinSortKey < right.pinSortKey ? -1 : 1;
+    }
+  } else if (left.pinSortKey !== null || right.pinSortKey !== null) {
+    return left.pinSortKey !== null ? -1 : 1;
+  }
+  return (
+    (right.pinnedAt ?? 0) - (left.pinnedAt ?? 0) ||
+    right.createdAt - left.createdAt ||
+    (left.id < right.id ? -1 : left.id > right.id ? 1 : 0)
+  );
+}
+
+/**
+ * Moving one pin to `toIndex` within `order`: the new order, plus the
+ * neighbours bb's `reorderPinned` keys the moved thread between.
+ */
+export function movePin(
+  order: readonly string[],
+  threadId: string,
+  toIndex: number,
+): {
+  order: string[];
+  previousThreadId: string | null;
+  nextThreadId: string | null;
+} | null {
+  const from = order.indexOf(threadId);
+  if (from === -1) return null;
+  const target = Math.max(0, Math.min(order.length - 1, toIndex));
+  if (target === from) return null;
+  const next = order.filter((id) => id !== threadId);
+  next.splice(target, 0, threadId);
+  return {
+    order: next,
+    previousThreadId: next[target - 1] ?? null,
+    nextThreadId: next[target + 1] ?? null,
+  };
 }
 
 export function countDescendants(node: TreeNode): number {
@@ -218,37 +295,156 @@ export function countDescendants(node: TreeNode): number {
   );
 }
 
-/**
- * Keep a node when it matches, or when anything beneath it does — a search
- * that dropped a matching worker because its parent's title did not match
- * would hide the very thread the user was looking for. Ancestors of a match
- * are reported so the caller can unfold them.
- */
-export function filterForest(
-  forest: readonly TreeNode[],
-  query: string,
-): { forest: TreeNode[]; matchedAncestors: Set<string> } {
-  const normalized = query.trim().toLowerCase();
-  const matchedAncestors = new Set<string>();
-  if (normalized.length === 0) {
-    return { forest: [...forest], matchedAncestors };
-  }
+/** Which state wins when several rows speak through one glyph. */
+const STATUS_RANK: Record<RowStatus, number> = {
+  none: 0,
+  unread: 1,
+  working: 2,
+  "needs-input": 3,
+  failed: 4,
+};
 
+export function worstStatus(left: RowStatus, right: RowStatus): RowStatus {
+  return STATUS_RANK[right] > STATUS_RANK[left] ? right : left;
+}
+
+/** What a collapsed parent is hiding, counted over every descendant. */
+export interface SubtreeSummary {
+  total: number;
+  /** Neither running, waiting on the user, nor failed. */
+  done: number;
+  working: number;
+  needsInput: number;
+  failed: number;
+  /** The most urgent state anywhere below, for the parent's glyph. */
+  worst: RowStatus;
+}
+
+/** A node's descendants summarized, and the latest activity in its subtree. */
+export interface NodeStats {
+  summary: SubtreeSummary;
+  /** The same number the "by activity" sort reads. */
+  activity: number;
+}
+
+/** {@link NodeStats} for every node, in one post-order walk. */
+export function forestStats(forest: readonly TreeNode[]): Map<string, NodeStats> {
+  const stats = new Map<string, NodeStats>();
+  const visit = (node: TreeNode): NodeStats => {
+    const summary: SubtreeSummary = {
+      total: 0,
+      done: 0,
+      working: 0,
+      needsInput: 0,
+      failed: 0,
+      worst: "none",
+    };
+    let activity = node.thread.updatedAt;
+    for (const child of node.children) {
+      const below = visit(child).summary;
+      const status = child.thread.status;
+      summary.total += 1 + below.total;
+      summary.done += below.done;
+      summary.working += below.working + Number(status === "working");
+      summary.needsInput += below.needsInput + Number(status === "needs-input");
+      summary.failed += below.failed + Number(status === "failed");
+      if (status !== "working" && status !== "needs-input" && status !== "failed") {
+        summary.done += 1;
+      }
+      summary.worst = worstStatus(worstStatus(summary.worst, status), below.worst);
+      activity = Math.max(activity, stats.get(child.thread.id)!.activity);
+    }
+    const result = { summary, activity };
+    stats.set(node.thread.id, result);
+    return result;
+  };
+  for (const node of forest) visit(node);
+  return stats;
+}
+
+/** The statuses the filter chips can narrow the list to. */
+export type StatusFilter = "needs-input" | "failed" | "working";
+
+export const STATUS_FILTERS: readonly StatusFilter[] = [
+  "needs-input",
+  "failed",
+  "working",
+];
+
+/** How many threads currently sit in each filterable status. */
+export function countStatuses(
+  threads: Iterable<TreeThread>,
+): Record<StatusFilter, number> {
+  const counts: Record<StatusFilter, number> = {
+    "needs-input": 0,
+    failed: 0,
+    working: 0,
+  };
+  for (const thread of threads) {
+    if (thread.status in counts) counts[thread.status as StatusFilter] += 1;
+  }
+  return counts;
+}
+
+/**
+ * A hidden worker with nothing left to say: not running, not waiting, not
+ * failed, nothing unread. Orchestrations leave dozens of these behind.
+ */
+export function isFinishedWorker(thread: TreeThread): boolean {
+  return thread.isHidden && thread.status === "none";
+}
+
+/** "now", "5m", "3h", "4d", "2w", "6mo", "1y": the age of a timestamp. */
+export function formatAge(timestamp: number, now: number): string {
+  const minutes = Math.floor(Math.max(0, now - timestamp) / 60_000);
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d`;
+  if (days < 30) return `${Math.floor(days / 7)}w`;
+  if (days < 365) return `${Math.floor(days / 30)}mo`;
+  return `${Math.floor(days / 365)}y`;
+}
+
+/**
+ * Keep a node when it matches, or when anything beneath it does — a filter
+ * that dropped a matching worker because its parent did not match would hide
+ * the very thread the user was looking for. Ancestors of a match are reported
+ * so the caller can unfold them.
+ */
+export function pruneForest(
+  forest: readonly TreeNode[],
+  matches: (thread: TreeThread) => boolean,
+): { forest: TreeNode[]; matchedAncestors: Set<string> } {
+  const matchedAncestors = new Set<string>();
   const keep = (node: TreeNode): TreeNode | null => {
     const children = node.children
       .map(keep)
       .filter((child): child is TreeNode => child !== null);
     if (children.length > 0) matchedAncestors.add(node.thread.id);
-    if (children.length === 0 && !node.thread.title.toLowerCase().includes(normalized)) {
-      return null;
-    }
+    if (children.length === 0 && !matches(node.thread)) return null;
     return { thread: node.thread, children };
   };
-
   return {
     forest: forest.map(keep).filter((node): node is TreeNode => node !== null),
     matchedAncestors,
   };
+}
+
+/** {@link pruneForest} by title. */
+export function filterForest(
+  forest: readonly TreeNode[],
+  query: string,
+): { forest: TreeNode[]; matchedAncestors: Set<string> } {
+  const normalized = query.trim().toLowerCase();
+  if (normalized.length === 0) {
+    return { forest: [...forest], matchedAncestors: new Set() };
+  }
+  return pruneForest(forest, (thread) =>
+    thread.title.toLowerCase().includes(normalized),
+  );
 }
 
 /** The ancestors above a thread, so the row you are viewing is never folded. */

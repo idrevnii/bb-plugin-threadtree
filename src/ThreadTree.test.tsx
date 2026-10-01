@@ -1,7 +1,11 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
-import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
+import {
+  loadPluginApp,
+  renderSlot,
+  type PluginSdkTestFakes,
+} from "@get-bb/plugin-sdk/testing/app";
 // The installed package's type, not the tsconfig-mapped one: renderSlot is
 // typed against it, and the two can differ by a patch release.
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
@@ -107,6 +111,7 @@ function render(
     threads?: PluginSidebarThread[];
     projects?: { id: string; name: string; isPersonal: boolean }[];
     pinnedProjects?: string[];
+    sdk?: PluginSdkTestFakes;
   } = {},
 ) {
   let pinnedProjects = options.pinnedProjects ?? [];
@@ -121,7 +126,9 @@ function render(
       searchQuery: options.searchQuery ?? "",
     },
     {
+      ...(options.sdk ? { sdk: options.sdk } : {}),
       rpc: {
+        previewAutoArchive: () => ({ now: 0, candidates: [] }),
         listChildren: () => ({
           children: options.children ?? [HIDDEN_WORKER],
         }),
@@ -444,7 +451,9 @@ describe("the thread tree slot", () => {
     });
 
     const titles = () =>
-      slot.getAllByRole("treeitem").map((row) => row.textContent);
+      slot
+        .getAllByRole("treeitem")
+        .map((row) => row.querySelector("[data-thread-title]")?.textContent);
     await waitFor(() => expect(titles()).toEqual(["Zulu", "Alpha"]));
 
     fireEvent.pointerDown(
@@ -522,5 +531,361 @@ describe("the thread tree slot", () => {
     await new Promise((resolve) => setTimeout(resolve, 400));
 
     expect(slot.inspection.rpcCalls.length).toBeGreaterThan(before);
+  });
+});
+
+const titlesOf = (slot: { getAllByRole: (role: "treeitem") => HTMLElement[] }) =>
+  slot
+    .getAllByRole("treeitem")
+    .map((row) => row.querySelector("[data-thread-title]")?.textContent);
+
+describe("collapsed parents", () => {
+  it("roll a failed worker up into the parent's glyph", async () => {
+    const slot = render({
+      children: [{ ...HIDDEN_WORKER, isWorking: false, isFailed: true }],
+    });
+
+    await slot.findByLabelText("A child thread failed");
+    (await slot.findByRole("button", { name: "Expand 1 child threads" })).click();
+    // Unfolded, the worker speaks for itself and the parent goes quiet.
+    await slot.findByLabelText("Thread failed");
+    expect(slot.queryByLabelText("A child thread failed")).toBeNull();
+  });
+
+  it("show progress while workers are still going", async () => {
+    const slot = render({
+      children: [
+        HIDDEN_WORKER,
+        { ...HIDDEN_WORKER, id: "thr_done", isWorking: false, title: "Done" },
+      ],
+    });
+
+    const badge = await slot.findByLabelText(
+      "2 child threads: 1 done, 1 working",
+    );
+    expect(badge.textContent).toBe("1/2");
+  });
+
+  it("show the plain count once every worker is done", async () => {
+    const slot = render({
+      children: [{ ...HIDDEN_WORKER, isWorking: false }],
+    });
+
+    const badge = await slot.findByLabelText("1 child threads: 1 done");
+    expect(badge.textContent).toBe("1");
+  });
+});
+
+describe("filters", () => {
+  const threads = [
+    hostThread({ id: "thr_parent", title: "Orchestrator" }),
+    hostThread({ id: "thr_quiet", title: "Quiet thread" }),
+  ];
+
+  it("narrow the list to a status, unfolding what holds the match", async () => {
+    const slot = render({ threads });
+
+    await slot.findByText("Quiet thread");
+    const chip = await slot.findByRole("button", { name: "Working 1" });
+    fireEvent.click(chip);
+
+    expect(chip.getAttribute("aria-pressed")).toBe("true");
+    await slot.findByText("Set up the VPS");
+    expect(slot.queryByText("Quiet thread")).toBeNull();
+
+    fireEvent.click(chip);
+    await slot.findByText("Quiet thread");
+  });
+
+  it("offer only the statuses something is in", async () => {
+    const slot = render({ threads });
+
+    await slot.findByRole("button", { name: "Working 1" });
+    expect(slot.queryByRole("button", { name: /Failed/ })).toBeNull();
+    expect(slot.queryByRole("button", { name: /Needs input/ })).toBeNull();
+  });
+
+  it("hide finished workers, and remember it", async () => {
+    const slot = render({
+      activeThreadId: "thr_worker",
+      children: [
+        { ...HIDDEN_WORKER, isWorking: false },
+        { ...HIDDEN_WORKER, id: "thr_busy", title: "Still going" },
+      ],
+    });
+
+    await slot.findByText("Set up the VPS");
+    fireEvent.pointerDown(
+      await slot.findByRole("button", { name: "Sort by activity" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: "Hide finished workers" }),
+    );
+
+    await waitFor(() => expect(slot.queryByText("Set up the VPS")).toBeNull());
+    expect(slot.getByText("Still going")).not.toBeNull();
+    expect(
+      window.localStorage.getItem("bb-plugin-threadtree.hide-finished-workers"),
+    ).toBe("true");
+  });
+});
+
+describe("rows", () => {
+  it("show how long ago the thread moved", async () => {
+    const slot = render({
+      children: [],
+      threads: [
+        hostThread({ id: "thr_parent", updatedAt: Date.now() - 3 * 3_600_000 }),
+      ],
+    });
+
+    const row = await slot.findByRole("treeitem");
+    expect(row.querySelector("time")?.textContent).toBe("3h");
+  });
+
+  it("rename a thread inline through the host", async () => {
+    const slot = render();
+
+    fireEvent.doubleClick(await slot.findByText("Orchestrator"));
+    const field = await slot.findByRole("textbox", { name: "Thread title" });
+    fireEvent.change(field, { target: { value: "Renamed" } });
+    fireEvent.keyDown(field, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(slot.inspection.sidebarActionCalls).toContainEqual(
+        expect.objectContaining({
+          method: "rename",
+          threadId: "thr_parent",
+          title: "Renamed",
+        }),
+      ),
+    );
+    // Shown at once, before bb's list catches up.
+    await slot.findByText("Renamed");
+  });
+
+  it("rename from the context menu, keeping the field once the menu closes", async () => {
+    const slot = render();
+
+    fireEvent.contextMenu(await slot.findByText("Orchestrator"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Rename" }));
+
+    const field = await slot.findByRole("textbox", { name: "Thread title" });
+    await waitFor(() => expect(document.activeElement).toBe(field));
+  });
+
+  it("give up a rename on Escape", async () => {
+    const slot = render();
+
+    fireEvent.doubleClick(await slot.findByText("Orchestrator"));
+    const field = await slot.findByRole("textbox", { name: "Thread title" });
+    fireEvent.change(field, { target: { value: "Nope" } });
+    fireEvent.keyDown(field, { key: "Escape" });
+
+    await slot.findByText("Orchestrator");
+    expect(
+      slot.inspection.sidebarActionCalls.filter((call) => call.method === "rename"),
+    ).toEqual([]);
+  });
+
+  it("rename a hidden worker through the SDK, which bb's list cannot", async () => {
+    const slot = render({
+      activeThreadId: "thr_worker",
+      sdk: { threads: { update: async () => ({}) as never } },
+    });
+
+    fireEvent.doubleClick(await slot.findByText("Set up the VPS"));
+    const field = await slot.findByRole("textbox", { name: "Thread title" });
+    fireEvent.change(field, { target: { value: "VPS ready" } });
+    fireEvent.blur(field);
+
+    await waitFor(() =>
+      expect(slot.inspection.sdkCalls).toContainEqual({
+        method: "threads.update",
+        args: [{ threadId: "thr_worker", title: "VPS ready" }],
+      }),
+    );
+  });
+
+  it("preview the last reply on hover", async () => {
+    const slot = render({
+      children: [],
+      sdk: {
+        threads: { output: async () => ({ output: "All 12 tests pass." }) },
+      },
+    });
+
+    fireEvent.pointerOver(await slot.findByRole("treeitem"));
+
+    const card = await screen.findByRole(
+      "tooltip",
+      {},
+      { timeout: 2_000 },
+    );
+    expect(card.textContent).toContain("All 12 tests pass.");
+    expect(slot.inspection.sdkCalls).toContainEqual({
+      method: "threads.output",
+      args: [{ threadId: "thr_parent" }],
+    });
+
+    fireEvent.pointerOut(await slot.findByRole("treeitem"));
+    await waitFor(() => expect(screen.queryByRole("tooltip")).toBeNull());
+  });
+});
+
+describe("pinned threads", () => {
+  const pinned = [
+    hostThread({ id: "thr_a", title: "Alpha", isPinned: true, pinSortKey: "a" }),
+    hostThread({ id: "thr_b", title: "Bravo", isPinned: true, pinSortKey: "b" }),
+    hostThread({ id: "thr_c", title: "Charlie", isPinned: true, pinSortKey: "c" }),
+    hostThread({ id: "thr_loose", title: "Loose", updatedAt: 99_999 }),
+  ];
+  const reorderSdk = (): PluginSdkTestFakes => ({
+    threads: { reorderPinned: async () => [] },
+  });
+
+  it("move with Alt+Arrow, keyed between their new neighbours", async () => {
+    const slot = render({ children: [], threads: pinned, sdk: reorderSdk() });
+
+    await waitFor(() =>
+      expect(titlesOf(slot)).toEqual(["Alpha", "Bravo", "Charlie", "Loose"]),
+    );
+    const alpha = slot.getAllByRole("treeitem")[0]!;
+    fireEvent.keyDown(alpha, { key: "ArrowDown", altKey: true });
+
+    // Held in place until bb's list reports the new keys.
+    await waitFor(() =>
+      expect(titlesOf(slot)).toEqual(["Bravo", "Alpha", "Charlie", "Loose"]),
+    );
+    expect(slot.inspection.sdkCalls).toContainEqual({
+      method: "threads.reorderPinned",
+      args: [{ threadId: "thr_a", previousThreadId: "thr_b", nextThreadId: "thr_c" }],
+    });
+  });
+
+  it("snap back and say so when the reorder is rejected", async () => {
+    const slot = render({
+      children: [],
+      threads: pinned,
+      sdk: {
+        threads: {
+          reorderPinned: async () => {
+            throw new Error("nope");
+          },
+        },
+      },
+    });
+
+    const charlie = (await slot.findByText("Charlie")).closest("a")!;
+    fireEvent.keyDown(charlie, { key: "ArrowUp", altKey: true });
+
+    await slot.findByRole("alert");
+    expect(titlesOf(slot)).toEqual(["Alpha", "Bravo", "Charlie", "Loose"]);
+  });
+
+  it("move by dragging, without opening the dragged row", async () => {
+    const slot = render({ children: [], threads: pinned, sdk: reorderSdk() });
+
+    await slot.findByText("Charlie");
+    // jsdom lays nothing out: give each pinned row a 30px box, top to bottom.
+    const rows = Array.from(
+      slot.container.querySelectorAll<HTMLElement>("[data-pin-row]"),
+    );
+    rows.forEach((row, index) => {
+      row.getBoundingClientRect = () =>
+        ({ top: index * 30, height: 30, bottom: index * 30 + 30 }) as DOMRect;
+    });
+    rows[0]!.closest("ul")!.getBoundingClientRect = () =>
+      ({ left: 0, right: 200, top: 0, bottom: 120 }) as DOMRect;
+
+    const charlie = (await slot.findByText("Charlie")).closest("a")!;
+    fireEvent.pointerDown(charlie, { button: 0, clientX: 50, clientY: 75 });
+    fireEvent.pointerMove(window, { clientX: 50, clientY: 40 });
+    fireEvent.pointerMove(window, { clientX: 50, clientY: 10 });
+    fireEvent.pointerUp(window, { clientX: 50, clientY: 10 });
+    // The harness records the split gesture's pointerdown as an `open`, so
+    // that one is expected; the click ending the drag must not add another.
+    const opens = () =>
+      slot.inspection.sidebarActionCalls.filter(
+        (call) => call.method === "open" && call.threadId === "thr_c",
+      ).length;
+    const before = opens();
+    fireEvent.click(charlie);
+    expect(opens()).toBe(before);
+
+    await waitFor(() =>
+      expect(titlesOf(slot)).toEqual(["Charlie", "Alpha", "Bravo", "Loose"]),
+    );
+    expect(slot.inspection.sdkCalls).toContainEqual({
+      method: "threads.reorderPinned",
+      args: [{ threadId: "thr_c", previousThreadId: null, nextThreadId: "thr_a" }],
+    });
+  });
+
+  it("leave a sideways drag to bb's split gesture", async () => {
+    const slot = render({ children: [], threads: pinned, sdk: reorderSdk() });
+
+    await slot.findByText("Charlie");
+    const list = slot.container.querySelector("[data-pin-row]")!.closest("ul")!;
+    list.getBoundingClientRect = () =>
+      ({ left: 0, right: 200, top: 0, bottom: 120 }) as DOMRect;
+
+    const charlie = (await slot.findByText("Charlie")).closest("a")!;
+    fireEvent.pointerDown(charlie, { button: 0, clientX: 50, clientY: 75 });
+    fireEvent.pointerMove(window, { clientX: 400, clientY: 10 });
+    fireEvent.pointerUp(window, { clientX: 400, clientY: 10 });
+
+    expect(slot.inspection.sdkCalls).toEqual([]);
+  });
+});
+
+describe("the auto-archive preview", () => {
+  const day = 86_400_000;
+  const now = 100 * day;
+  const candidates = [
+    {
+      id: "thr_old",
+      projectId: "proj_1",
+      projectName: "Project",
+      title: "Forgotten",
+      lastTouchedAt: now - 20 * day,
+      threadCount: 4,
+    },
+    {
+      id: "thr_recent",
+      projectId: "proj_1",
+      projectName: "Project",
+      title: "Yesterday's",
+      lastTouchedAt: now - 2 * day,
+      threadCount: 1,
+    },
+  ];
+  const renderPreview = (setting: string) =>
+    renderSlot(
+      app.settingsSections[0]!,
+      {},
+      {
+        rpc: { previewAutoArchive: () => ({ now, candidates }) },
+        settings: { autoArchiveAfter: setting },
+      },
+    );
+
+  it("lists what the current setting archives, children counted", async () => {
+    const slot = renderPreview("1 week");
+
+    await slot.findByText("1 thread idle for 1 week, plus 3 child threads");
+    expect(slot.getByText("Forgotten")).not.toBeNull();
+    expect(slot.queryByText("Yesterday's")).toBeNull();
+    expect(slot.getByRole("radio", { name: /1 day/ }).textContent).toContain("2");
+  });
+
+  it("previews another period without changing the setting", async () => {
+    const slot = renderPreview("Off");
+
+    await slot.findByText(/Auto-archive is off/);
+    fireEvent.click(await slot.findByRole("radio", { name: /1 day/ }));
+
+    await slot.findByText("Yesterday's");
+    expect(slot.getByText("Forgotten")).not.toBeNull();
   });
 });

@@ -10,6 +10,7 @@
 // under Settings → Appearance → Sidebar. The New-thread button, the search
 // field, the plugin nav rows, and the footer stay host-rendered.
 import { definePluginApp } from "@get-bb/plugin-sdk/app";
+import { AutoArchivePreview } from "./src/AutoArchivePreview";
 import { ThreadTree } from "./src/ThreadTree";
 
 export default definePluginApp((app) => {
@@ -19,5 +20,13 @@ export default definePluginApp((app) => {
     description:
       "Parent threads with their children nested and collapsible, hidden orchestration workers included.",
     component: ThreadTree,
+  });
+
+  // Sits on the plugin's settings page, next to the auto-archive setting.
+  app.slots.settingsSection({
+    id: "auto-archive-preview",
+    title: "Auto-archive preview",
+    description: "What each idle period would archive on its next sweep.",
+    component: AutoArchivePreview,
   });
 });

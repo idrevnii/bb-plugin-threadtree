@@ -1,9 +1,11 @@
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   experimental_useSidebarThreadActions as useSidebarThreadActions,
   useBbNavigate,
   useRpc,
+  useSdk,
   type PluginSidebarProject,
+  type PluginSidebarThread,
   type PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
 import { Icon } from "@/src/components/ui/icon";
@@ -22,31 +24,56 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/src/components/ui/dropdown-menu";
 import type { ProjectHost, rpcContract } from "../server";
 import { ProjectPathDialog } from "./ProjectPathDialog";
-import { TreeRow } from "./TreeRow";
+import { TreeRow, type PinControls } from "./TreeRow";
+import { usePinDrag, type PinDragState } from "./usePinDrag";
 import { usePinnedProjects } from "./usePinnedProjects";
 import { useTreeThreads } from "./useTreeThreads";
 import {
   loadCollapsedProjects,
   loadExpanded,
+  loadHideFinished,
   loadSortMode,
   saveCollapsedProjects,
   saveExpanded,
+  saveHideFinished,
   saveSortMode,
 } from "./expansion";
 import {
   ancestorIds,
   buildForest,
+  comparePins,
   compareTitles,
+  countStatuses,
   filterForest,
   flattenForest,
+  forestStats,
+  isFinishedWorker,
   latestActivity,
+  movePin,
+  pruneForest,
+  STATUS_FILTERS,
+  type FlatRow,
   type SortMode,
+  type StatusFilter,
   type TreeNode,
 } from "./tree";
+
+/** The age column only shows minutes, so a minute is fine enough. */
+const CLOCK_TICK_MS = 60_000;
+
+function useNow(): number {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setNow(Date.now()), CLOCK_TICK_MS);
+    return () => clearInterval(timer);
+  }, []);
+  return now;
+}
 
 /**
  * The sidebar's scrolling list, as a tree.
@@ -59,11 +86,14 @@ import {
 export function ThreadTree({
   activeThreadId,
   activeProjectId,
+  isCompactViewport,
   onNavigate,
   searchQuery,
 }: PluginThreadListProps) {
-  const { status, threads, projects } = useTreeThreads();
+  const { status, threads, projects, refetch } = useTreeThreads();
   const navigate = useBbNavigate();
+  const sdk = useSdk();
+  const now = useNow();
   const [expanded, setExpanded] = useState<Set<string>>(loadExpanded);
   const [collapsedProjects, setCollapsedProjects] = useState<Set<string>>(
     loadCollapsedProjects,
@@ -71,6 +101,60 @@ export function ThreadTree({
   const { pinned: pinnedProjects, toggle: togglePinProject } =
     usePinnedProjects();
   const [sortMode, setSortMode] = useState<SortMode>(loadSortMode);
+  // Not remembered: a status filter left on would greet the next session
+  // with a list that looks like threads went missing.
+  const [statusFilter, setStatusFilter] = useState<ReadonlySet<StatusFilter>>(
+    () => new Set(),
+  );
+  const [hideFinished, setHideFinished] = useState(loadHideFinished);
+  const [pinOverride, setPinOverride] = useState<readonly string[] | null>(null);
+  const [pinError, setPinError] = useState<string | null>(null);
+
+  const toggleStatusFilter = useCallback((filter: StatusFilter) => {
+    setStatusFilter((current) => {
+      const next = new Set(current);
+      if (!next.delete(filter)) next.add(filter);
+      return next;
+    });
+  }, []);
+
+  const changeHideFinished = useCallback((hide: boolean) => {
+    setHideFinished(hide);
+    saveHideFinished(hide);
+  }, []);
+
+  const movePinned = useCallback(
+    (order: readonly string[], threadId: string, toIndex: number) => {
+      const move = movePin(order, threadId, toIndex);
+      if (!move) return;
+      setPinError(null);
+      setPinOverride(move.order);
+      sdk.threads
+        .reorderPinned({
+          threadId,
+          previousThreadId: move.previousThreadId,
+          nextThreadId: move.nextThreadId,
+        })
+        .catch(() => {
+          setPinOverride(null);
+          setPinError("Could not reorder pinned threads.");
+        });
+    },
+    [sdk],
+  );
+  const pinDrag = usePinDrag(movePinned);
+
+  // The override only bridges the round trip: once bb's own pin order agrees
+  // with the drop, the host list is the truth again.
+  useEffect(() => {
+    if (!pinOverride) return;
+    const pins = pinOverride
+      .map((id) => threads.get(id)?.host)
+      .filter((host): host is PluginSidebarThread => host?.isPinned === true);
+    const hostOrder = [...pins].sort(comparePins).map((host) => host.id);
+    const wanted = pins.map((host) => host.id);
+    if (hostOrder.join("\n") === wanted.join("\n")) setPinOverride(null);
+  }, [threads, pinOverride]);
 
   const changeSort = useCallback((mode: SortMode) => {
     setSortMode(mode);
@@ -95,10 +179,35 @@ export function ThreadTree({
     });
   }, []);
 
-  const { forest, matchedAncestors } = useMemo(
-    () => filterForest(buildForest(threads, sortMode), searchQuery),
-    [threads, searchQuery, sortMode],
+  const fullForest = useMemo(
+    () => buildForest(threads, sortMode, pinOverride ?? undefined),
+    [threads, sortMode, pinOverride],
   );
+  // From the unfiltered tree, so hiding finished workers does not make a
+  // parent's progress look further behind than it is.
+  const stats = useMemo(() => forestStats(fullForest), [fullForest]);
+  const statusCounts = useMemo(() => countStatuses(threads.values()), [threads]);
+  const isFiltering = searchQuery.trim() !== "" || statusFilter.size > 0;
+
+  const { forest, matchedAncestors } = useMemo(() => {
+    // Hiding finished workers is a standing view preference, not a search:
+    // it unfolds nothing.
+    const visible = hideFinished
+      ? pruneForest(fullForest, (thread) => !isFinishedWorker(thread)).forest
+      : fullForest;
+    const searched = filterForest(visible, searchQuery);
+    if (statusFilter.size === 0) return searched;
+    const filtered = pruneForest(searched.forest, (thread) =>
+      statusFilter.has(thread.status as StatusFilter),
+    );
+    return {
+      forest: filtered.forest,
+      matchedAncestors: new Set([
+        ...searched.matchedAncestors,
+        ...filtered.matchedAncestors,
+      ]),
+    };
+  }, [fullForest, hideFinished, searchQuery, statusFilter]);
 
   // A parent is opened for you when the thread you are viewing lives inside
   // it, or when the search matched something it contains — otherwise the row
@@ -115,11 +224,11 @@ export function ThreadTree({
       groupByProject(
         forest,
         projects,
-        !searchQuery.trim(),
+        !isFiltering,
         sortMode,
         pinnedProjects,
       ),
-    [forest, projects, searchQuery, sortMode, pinnedProjects],
+    [forest, projects, isFiltering, sortMode, pinnedProjects],
   );
 
   if (status === "loading") return null;
@@ -140,11 +249,23 @@ export function ThreadTree({
         <ProjectControls
           sortMode={sortMode}
           onSortChange={changeSort}
+          hideFinished={hideFinished}
+          onHideFinishedChange={changeHideFinished}
           onOpen={(projectId) => {
             navigate.toProject(projectId);
             onNavigate();
           }}
         />
+      ) : null}
+      <FilterChips
+        counts={statusCounts}
+        active={statusFilter}
+        onToggle={toggleStatusFilter}
+      />
+      {pinError ? (
+        <p role="alert" className="px-2 pb-1 text-xs text-destructive">
+          {pinError}
+        </p>
       ) : null}
 
       {groups.length === 0 ? (
@@ -152,7 +273,11 @@ export function ThreadTree({
           role="status"
           className="px-2 py-6 text-center text-xs text-muted-foreground"
         >
-          {searchQuery.trim() ? "No threads found" : "No threads yet"}
+          {statusFilter.size > 0
+            ? "No matching threads"
+            : searchQuery.trim()
+              ? "No threads found"
+              : "No threads yet"}
         </p>
       ) : null}
       {groups.map((group) => {
@@ -162,7 +287,14 @@ export function ThreadTree({
           project != null &&
           !project.isPersonal &&
           collapsedProjects.has(project.id) &&
-          !searchQuery.trim();
+          !isFiltering;
+        // Reordering a filtered list would key pins against neighbours the
+        // user cannot see.
+        const pinOrder = isFiltering
+          ? []
+          : group.roots
+              .filter((root) => root.thread.host?.isPinned)
+              .map((root) => root.thread.id);
         return (
           <section key={group.projectId} aria-label={name}>
             {project && !project.isPersonal ? (
@@ -191,19 +323,120 @@ export function ThreadTree({
                 aria-label={name}
                 className="flex flex-col gap-px"
               >
-                {flattenForest(group.roots, effectiveExpanded).map((row) => (
-                  <TreeRow
-                    key={row.node.thread.id}
-                    row={row}
-                    isActive={row.node.thread.id === activeThreadId}
-                    nestedUnderProject={project != null && !project.isPersonal}
-                    onNavigate={onNavigate}
-                    onToggle={toggle}
-                  />
-                ))}
+                {flattenForest(group.roots, effectiveExpanded).map((row) => {
+                  const rowStats = stats.get(row.node.thread.id);
+                  return (
+                    <TreeRow
+                      key={row.node.thread.id}
+                      row={row}
+                      isActive={row.node.thread.id === activeThreadId}
+                      nestedUnderProject={project != null && !project.isPersonal}
+                      now={now}
+                      summary={rowStats?.summary ?? null}
+                      activity={rowStats?.activity ?? row.node.thread.updatedAt}
+                      previewEnabled={!isCompactViewport && pinDrag.drag === null}
+                      pin={pinControls(row, pinOrder, pinDrag.drag, {
+                        begin: pinDrag.begin,
+                        consumeDragClick: pinDrag.consumeDragClick,
+                        move: movePinned,
+                      })}
+                      onNavigate={onNavigate}
+                      onToggle={toggle}
+                      onHiddenRenamed={refetch}
+                    />
+                  );
+                })}
               </ul>
             ) : null}
           </section>
+        );
+      })}
+    </div>
+  );
+}
+
+/** Reorder controls for a pinned root, when its project has pins to swap. */
+function pinControls(
+  row: FlatRow,
+  order: readonly string[],
+  drag: PinDragState | null,
+  handlers: {
+    begin: ReturnType<typeof usePinDrag>["begin"];
+    consumeDragClick: () => boolean;
+    move: (order: readonly string[], threadId: string, toIndex: number) => void;
+  },
+): PinControls | null {
+  const threadId = row.node.thread.id;
+  const index = row.depth === 0 ? order.indexOf(threadId) : -1;
+  if (index === -1 || order.length < 2) return null;
+  let dropEdge: PinControls["dropEdge"] = null;
+  if (drag) {
+    const from = order.indexOf(drag.threadId);
+    // Dropping a row next to itself moves nothing; draw no line for it.
+    const moves = drag.insertion !== from && drag.insertion !== from + 1;
+    if (moves && drag.insertion === index) dropEdge = "before";
+    else if (moves && drag.insertion === order.length && index === order.length - 1) {
+      dropEdge = "after";
+    }
+  }
+  return {
+    order,
+    index,
+    dropEdge,
+    isDragging: drag?.threadId === threadId,
+    onPointerDown: (event) => handlers.begin(event, threadId, order),
+    consumeDragClick: handlers.consumeDragClick,
+    onMove: (toIndex) => handlers.move(order, threadId, toIndex),
+  };
+}
+
+const FILTER_LABELS: Record<StatusFilter, string> = {
+  "needs-input": "Needs input",
+  failed: "Failed",
+  working: "Working",
+};
+
+/**
+ * One chip per status that something is in right now (or that is switched
+ * on), so the row stays out of the way while nothing needs attention.
+ * Several chips together mean "any of these".
+ */
+function FilterChips({
+  counts,
+  active,
+  onToggle,
+}: {
+  counts: Record<StatusFilter, number>;
+  active: ReadonlySet<StatusFilter>;
+  onToggle: (filter: StatusFilter) => void;
+}) {
+  const visible = STATUS_FILTERS.filter(
+    (filter) => counts[filter] > 0 || active.has(filter),
+  );
+  if (visible.length === 0) return null;
+  return (
+    <div
+      role="group"
+      aria-label="Filter threads"
+      className="flex flex-wrap gap-1 px-1.5 pb-2"
+    >
+      {visible.map((filter) => {
+        const isActive = active.has(filter);
+        return (
+          <button
+            key={filter}
+            type="button"
+            aria-pressed={isActive}
+            onClick={() => onToggle(filter)}
+            className={`flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs ${
+              isActive
+                ? "border-primary bg-primary text-primary-foreground"
+                : "border-sidebar-border text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
+            }`}
+          >
+            {FILTER_LABELS[filter]}
+            <span className="tabular-nums opacity-70">{counts[filter]}</span>
+          </button>
         );
       })}
     </div>
@@ -447,9 +680,13 @@ const SORT_LABELS: Record<SortMode, string> = {
 function SortMenu({
   sortMode,
   onSortChange,
+  hideFinished,
+  onHideFinishedChange,
 }: {
   sortMode: SortMode;
   onSortChange: (mode: SortMode) => void;
+  hideFinished: boolean;
+  onHideFinishedChange: (hide: boolean) => void;
 }) {
   return (
     <DropdownMenu>
@@ -474,6 +711,15 @@ function SortMenu({
             Sort by {SORT_LABELS[mode].toLowerCase()}
           </DropdownMenuItem>
         ))}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem onSelect={() => onHideFinishedChange(!hideFinished)}>
+          <Icon
+            name="Check"
+            aria-hidden="true"
+            className={hideFinished ? "" : "opacity-0"}
+          />
+          Hide finished workers
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
@@ -482,10 +728,14 @@ function SortMenu({
 function ProjectControls({
   sortMode,
   onSortChange,
+  hideFinished,
+  onHideFinishedChange,
   onOpen,
 }: {
   sortMode: SortMode;
   onSortChange: (mode: SortMode) => void;
+  hideFinished: boolean;
+  onHideFinishedChange: (hide: boolean) => void;
   onOpen: (projectId: string) => void;
 }) {
   const rpc = useRpc<typeof rpcContract>();
@@ -527,7 +777,12 @@ function ProjectControls({
         <h2 className="flex-1 text-sm font-medium text-muted-foreground/70">
           Projects
         </h2>
-        <SortMenu sortMode={sortMode} onSortChange={onSortChange} />
+        <SortMenu
+          sortMode={sortMode}
+          onSortChange={onSortChange}
+          hideFinished={hideFinished}
+          onHideFinishedChange={onHideFinishedChange}
+        />
         <button
           type="button"
           onClick={() => void openForm()}
