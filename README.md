@@ -74,7 +74,20 @@ bb plugin dev        # watch loop while editing
   opening it (mouse only).
 - **Keyboard** — bb's numbered jumps and `thread.next` / `thread.previous`
   work on every row, hidden ones included, because the host clicks the row
-  element rather than opening by id.
+  element rather than opening by id. The thread you open is scrolled into
+  view, and its project unfolds for as long as it is open (your fold is kept
+  for later).
+- **Palette commands** (Mod+Shift+P, each bindable in Settings → Keyboard):
+  *Thread tree: Collapse all projects*, *Expand all projects*, *Collapse
+  other projects* (keep only the current one open), *Pin or unpin current
+  project*, *Show or hide finished workers*. They are hidden while another
+  sidebar list is picked.
+- **Jumps from other plugins** — bb's new-thread screen has no project in
+  its route, so a plugin that opens it for a project can say where it went:
+  `window.dispatchEvent(new CustomEvent("bb-threadtree:reveal", { detail: {
+  projectId } }))` unfolds that project, scrolls to it, and marks it current
+  until a thread opens. The Quick actions plugin (bb-plugin-quick-actions) does
+  this for every "New thread in …" jump.
 - **Auto-archive** is off by default. Pick an idle period under **Tools →
   Thread tree** and an hourly sweep archives root threads nobody has touched
   (written to or opened) since then — skipping pinned threads, running work,

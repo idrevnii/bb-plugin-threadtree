@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it } from "vitest";
-import { cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import {
   loadPluginApp,
   renderSlot,
@@ -10,6 +10,7 @@ import {
 // typed against it, and the two can differ by a patch release.
 import type { PluginSidebarThread } from "@get-bb/plugin-sdk";
 import type { ChildThread } from "../server";
+import { isTreeMounted, REVEAL_EVENT, sendTreeCommand } from "./treeCommands";
 
 Object.defineProperty(window, "matchMedia", {
   writable: true,
@@ -106,6 +107,7 @@ function render(
   options: {
     children?: ChildThread[];
     activeThreadId?: string | null;
+    activeProjectId?: string | null;
     searchQuery?: string;
     personalProject?: boolean;
     threads?: PluginSidebarThread[];
@@ -120,7 +122,7 @@ function render(
     registration,
     {
       activeThreadId: options.activeThreadId ?? null,
-      activeProjectId: "proj_1",
+      activeProjectId: options.activeProjectId ?? "proj_1",
       isCompactViewport: false,
       onNavigate: () => {},
       searchQuery: options.searchQuery ?? "",
@@ -887,5 +889,89 @@ describe("the auto-archive preview", () => {
 
     await slot.findByText("Yesterday's");
     expect(slot.getByText("Forgotten")).not.toBeNull();
+  });
+});
+
+describe("keyboard jumps", () => {
+  const twoProjects = {
+    threads: [
+      hostThread({ id: "thr_a", title: "Alpha work", projectId: "proj_1" }),
+      hostThread({ id: "thr_b", title: "Beta work", projectId: "proj_2" }),
+    ],
+    projects: [
+      { id: "proj_1", name: "Alpha", isPersonal: false },
+      { id: "proj_2", name: "Beta", isPersonal: false },
+    ],
+  };
+
+  it("unfolds and marks a project another plugin jumped to", async () => {
+    window.localStorage.setItem(
+      "bb-plugin-threadtree.collapsed-projects",
+      JSON.stringify(["proj_2"]),
+    );
+    const slot = render({ ...twoProjects, activeProjectId: null });
+
+    await slot.findByText("Alpha work");
+    expect(slot.queryByText("Beta work")).toBeNull();
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent(REVEAL_EVENT, { detail: { projectId: "proj_2" } }),
+      );
+    });
+
+    await slot.findByText("Beta work");
+    const header = (await slot.findByRole("button", { name: "Open Beta" })).parentElement;
+    expect(header?.classList.contains("bg-sidebar-accent")).toBe(true);
+    expect(
+      JSON.parse(window.localStorage.getItem("bb-plugin-threadtree.collapsed-projects")!),
+    ).toEqual([]);
+  });
+
+  it("keeps the open thread's project unfolded without forgetting the fold", async () => {
+    window.localStorage.setItem(
+      "bb-plugin-threadtree.collapsed-projects",
+      JSON.stringify(["proj_2"]),
+    );
+    const slot = render({ ...twoProjects, activeThreadId: "thr_b", activeProjectId: "proj_2" });
+
+    await slot.findByText("Beta work");
+    expect(
+      JSON.parse(window.localStorage.getItem("bb-plugin-threadtree.collapsed-projects")!),
+    ).toEqual(["proj_2"]);
+  });
+
+  it("folds every project but the current one from a palette command", async () => {
+    const slot = render({ ...twoProjects, activeThreadId: "thr_a" });
+
+    await slot.findByText("Beta work");
+    expect(isTreeMounted()).toBe(true);
+    act(() => sendTreeCommand({ kind: "focus-project", projectId: null }));
+    await waitFor(() => expect(slot.queryByText("Beta work")).toBeNull());
+    expect(slot.getByText("Alpha work")).not.toBeNull();
+
+    act(() => sendTreeCommand({ kind: "expand-all" }));
+    await slot.findByText("Beta work");
+    act(() => sendTreeCommand({ kind: "collapse-all" }));
+    await waitFor(() => expect(slot.queryByText("Beta work")).toBeNull());
+    // The open thread's project stays visible even when everything is folded.
+    expect(slot.getByText("Alpha work")).not.toBeNull();
+
+    slot.lifecycle.unmount();
+    expect(isTreeMounted()).toBe(false);
+  });
+
+  it("pins the current project from a palette command", async () => {
+    const slot = render({ ...twoProjects, activeThreadId: "thr_b", activeProjectId: "proj_2" });
+
+    await slot.findByText("Beta work");
+    act(() => sendTreeCommand({ kind: "toggle-pin-project", projectId: null }));
+    await waitFor(() =>
+      expect(slot.inspection.rpcCalls).toContainEqual(
+        expect.objectContaining({
+          method: "setProjectPinned",
+          input: { projectId: "proj_2", pinned: true },
+        }),
+      ),
+    );
   });
 });

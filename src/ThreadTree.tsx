@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   experimental_useSidebarThreadActions as useSidebarThreadActions,
   useBbNavigate,
@@ -33,6 +33,12 @@ import { TreeRow, type PinControls } from "./TreeRow";
 import { usePinDrag, type PinDragState } from "./usePinDrag";
 import { usePinnedProjects } from "./usePinnedProjects";
 import { useTreeThreads } from "./useTreeThreads";
+import {
+  onTreeCommand,
+  parseReveal,
+  REVEAL_EVENT,
+  type TreeCommand,
+} from "./treeCommands";
 import {
   loadCollapsedProjects,
   loadExpanded,
@@ -179,6 +185,97 @@ export function ThreadTree({
     });
   }, []);
 
+  // A project another plugin jumped to (bb's new-thread screen has no
+  // project in its route), shown as current until a thread opens.
+  const [revealedProjectId, setRevealedProjectId] = useState<string | null>(null);
+  useEffect(() => {
+    if (activeThreadId !== null) setRevealedProjectId(null);
+  }, [activeThreadId]);
+  const currentProjectId =
+    activeThreadId !== null ? activeProjectId : (revealedProjectId ?? activeProjectId);
+
+  const setCollapsed = useCallback((next: Set<string>) => {
+    setCollapsedProjects(next);
+    saveCollapsedProjects(next);
+  }, []);
+
+  // What to bring into view once it has rendered: the row being opened, or a
+  // project someone jumped to.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  const scrollTarget = useRef<{ attribute: string; id: string } | null>(null);
+  useEffect(() => {
+    if (activeThreadId !== null) {
+      scrollTarget.current = { attribute: "data-sidebar-thread-id", id: activeThreadId };
+    }
+  }, [activeThreadId]);
+  useEffect(() => {
+    const target = scrollTarget.current;
+    if (target === null || listRef.current === null) return;
+    const element = Array.from(
+      listRef.current.querySelectorAll(`[${target.attribute}]`),
+    ).find(
+      (candidate) => candidate.getAttribute(target.attribute) === target.id,
+    );
+    if (element === undefined) return;
+    scrollTarget.current = null;
+    element.scrollIntoView?.({ block: "nearest" });
+  });
+
+  const reveal = useCallback(
+    (projectId: string) => {
+      setRevealedProjectId(projectId);
+      setCollapsedProjects((current) => {
+        if (!current.has(projectId)) return current;
+        const next = new Set(current);
+        next.delete(projectId);
+        saveCollapsedProjects(next);
+        return next;
+      });
+      scrollTarget.current = { attribute: "data-threadtree-project", id: projectId };
+    },
+    [],
+  );
+  useEffect(() => {
+    const onReveal = (event: Event) => {
+      const detail = parseReveal((event as CustomEvent<unknown>).detail);
+      if (detail !== null) reveal(detail.projectId);
+    };
+    window.addEventListener(REVEAL_EVENT, onReveal);
+    return () => window.removeEventListener(REVEAL_EVENT, onReveal);
+  }, [reveal]);
+
+  // Palette commands act on the newest state; subscribe once, read through a ref.
+  const runCommand = useRef<(command: TreeCommand) => void>(() => {});
+  runCommand.current = (command) => {
+    const projectIds = projects
+      .filter((project) => !project.isPersonal)
+      .map((project) => project.id);
+    switch (command.kind) {
+      case "collapse-all":
+        setCollapsed(new Set(projectIds));
+        return;
+      case "expand-all":
+        setCollapsed(new Set());
+        return;
+      case "focus-project": {
+        const keep = command.projectId ?? currentProjectId;
+        if (keep === null) return;
+        setCollapsed(new Set(projectIds.filter((id) => id !== keep)));
+        scrollTarget.current = { attribute: "data-threadtree-project", id: keep };
+        return;
+      }
+      case "toggle-pin-project": {
+        const target = command.projectId ?? currentProjectId;
+        if (target !== null && projectIds.includes(target)) togglePinProject(target);
+        return;
+      }
+      case "toggle-hide-finished":
+        changeHideFinished(!hideFinished);
+        return;
+    }
+  };
+  useEffect(() => onTreeCommand((command) => runCommand.current(command)), []);
+
   const fullForest = useMemo(
     () => buildForest(threads, sortMode, pinOverride ?? undefined),
     [threads, sortMode, pinOverride],
@@ -244,7 +341,7 @@ export function ThreadTree({
   }
 
   return (
-    <div className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-2">
+    <div ref={listRef} className="min-h-0 flex-1 overflow-y-auto px-1.5 pb-2">
       {!searchQuery.trim() ? (
         <ProjectControls
           sortMode={sortMode}
@@ -283,11 +380,15 @@ export function ThreadTree({
       {groups.map((group) => {
         const project = group.project;
         const name = project?.isPersonal ? "Chats" : (project?.name ?? "Threads");
+        // The project holding the open thread stays unfolded, the way a
+        // parent of the open thread does: otherwise the row you jumped to
+        // would sit behind a chevron.
         const isProjectCollapsed =
           project != null &&
           !project.isPersonal &&
           collapsedProjects.has(project.id) &&
-          !isFiltering;
+          !isFiltering &&
+          !(activeThreadId !== null && activeProjectId === project.id);
         // Reordering a filtered list would key pins against neighbours the
         // user cannot see.
         const pinOrder = isFiltering
@@ -301,7 +402,7 @@ export function ThreadTree({
               <ProjectHeader
                 project={project}
                 isActive={
-                  activeThreadId === null && activeProjectId === project.id
+                  activeThreadId === null && currentProjectId === project.id
                 }
                 isCollapsed={isProjectCollapsed}
                 isPinned={pinnedProjects.has(project.id)}
@@ -488,6 +589,7 @@ function ProjectHeader({
   return (
     <>
       <div
+        data-threadtree-project={project.id}
         className={`group/project flex min-w-0 items-center rounded-md py-0.5 hover:bg-sidebar-accent hover:text-foreground ${
           isActive
             ? "bg-sidebar-accent text-foreground"
